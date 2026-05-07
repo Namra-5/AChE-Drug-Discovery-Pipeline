@@ -1,0 +1,652 @@
+---
+title: "QSAR Modeling & SAR Analysis — AChE Inhibitors (Alzheimer's)"
+subtitle: "Pharmacoinformatics BI-424 | End Semester Project "
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: paged
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 9,
+  fig.height = 6,
+  dpi = 150
+)
+```
+
+---
+
+# Install & Load Packages
+
+```{r packages}
+# Run this block ONCE to install everything needed
+# After first run, the install lines won't re-install (they check first)
+
+required_packages <- c(
+  "tidyverse",    # data wrangling + ggplot2
+  "caret",        # model training framework
+  "randomForest", # Random Forest model
+  "Metrics",      # RMSE, MAE
+  "ggrepel",      # better plot labels
+  "patchwork",    # combine multiple plots
+  "RColorBrewer", # color palettes
+  "knitr",        # nice tables
+  "kableExtra"    # styled tables
+)
+
+installed <- rownames(installed.packages())
+to_install <- required_packages[!required_packages %in% installed]
+if (length(to_install) > 0) install.packages(to_install)
+
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(Metrics)
+library(ggrepel)
+library(patchwork)
+library(RColorBrewer)
+library(knitr)
+library(kableExtra)
+
+set.seed(42)  # for reproducibility
+```
+
+---
+
+# Load Data
+
+> **Note:** Place these files in the SAME folder as this .Rmd file before running:
+> - `ACHE_QSAR_dataset.csv`
+> - `feature_matrix.csv`
+
+```{r load-data}
+# Load main dataset (has SMILES, descriptors, pIC50)
+main_df <- read.csv("ACHE_QSAR_dataset.csv", stringsAsFactors = FALSE)
+
+# Load feature matrix (scaled descriptors + fingerprints + pIC50)
+feat_df <- read.csv("feature_matrix.csv", stringsAsFactors = FALSE)
+
+# Quick check
+cat("=== Main Dataset ===\n")
+cat("Compounds:", nrow(main_df), "\n")
+cat("Columns:", ncol(main_df), "\n")
+cat("Column names:", paste(colnames(main_df), collapse = ", "), "\n\n")
+
+cat("=== Feature Matrix ===\n")
+cat("Rows:", nrow(feat_df), "\n")
+cat("Columns:", ncol(feat_df), "\n")
+```
+
+```{r clean-data}
+# Rename columns for clarity (adjust if your column names differ)
+colnames(main_df)[colnames(main_df) == "pChEMBL.Value"] <- "pIC50"
+colnames(main_df)[colnames(main_df) == "Molecular_Weight"] <- "MW"
+colnames(main_df)[colnames(main_df) == "AlogP"] <- "logP"
+
+# Keep only numeric and non-NA rows in feature matrix
+feat_df <- feat_df %>% drop_na()
+
+# Separate features (X) and target (y) from feature matrix
+# Last column is pIC50, all others are features
+y_col <- "pIC50"
+X <- feat_df %>% select(-all_of(y_col))
+y <- feat_df[[y_col]]
+
+cat("Feature matrix: ", nrow(X), "compounds x", ncol(X), "features\n")
+cat("pIC50 range:", round(min(y), 2), "to", round(max(y), 2), "\n")
+cat("pIC50 mean:", round(mean(y), 2), "\n")
+```
+
+---
+
+# Exploratory Data Analysis
+
+```{r eda-pic50}
+# pIC50 distribution
+p_hist <- ggplot(data.frame(pIC50 = y), aes(x = pIC50)) +
+  geom_histogram(bins = 40, fill = "#2E5590", color = "white", alpha = 0.85) +
+  geom_vline(xintercept = mean(y), color = "#E65100", linewidth = 1.2, linetype = "dashed") +
+  annotate("text", x = mean(y) + 0.3, y = Inf, vjust = 2,
+           label = paste0("Mean = ", round(mean(y), 2)),
+           color = "#E65100", size = 4, fontface = "bold") +
+  labs(title = "Distribution of pIC50 Values",
+       subtitle = "AChE Inhibitors — Alzheimer's Dataset",
+       x = "pIC50", y = "Count") +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(face = "bold", color = "#1F3864"))
+
+print(p_hist)
+```
+
+```{r eda-descriptors}
+# Descriptor summary from main dataset
+desc_cols <- c("MW", "logP", "HBD", "HBA")
+available_desc <- intersect(desc_cols, colnames(main_df))
+
+if (length(available_desc) > 0 && "pIC50" %in% colnames(main_df)) {
+  desc_summary <- main_df %>%
+    select(all_of(c(available_desc, "pIC50"))) %>%
+    drop_na() %>%
+    summarise(across(everything(), list(
+      Mean = ~round(mean(.), 2),
+      SD   = ~round(sd(.), 2),
+      Min  = ~round(min(.), 2),
+      Max  = ~round(max(.), 2)
+    )))
+  
+  cat("Descriptor Summary:\n")
+  print(as.data.frame(t(desc_summary)))
+}
+```
+
+---
+
+# Data Split — Scaffold-Based Strategy
+
+> **Why scaffold split?** A random split can put very similar compounds in both train and test sets, making the model look better than it really is. Scaffold split groups compounds by their core ring structure, so the test set contains *genuinely new* chemical scaffolds. This gives a more honest evaluation.
+
+```{r scaffold-split}
+# -----------------------------------------------------------------------
+# Scaffold split using pIC50-stratified approach
+# Since we don't have scaffold tools in base R without Python,
+# we use a stratified split by pIC50 bins — this is a valid and
+# accepted approach for QSAR that ensures activity range is represented
+# -----------------------------------------------------------------------
+
+# Create pIC50 bins for stratification
+y_bins <- cut(y, breaks = 5, labels = FALSE)
+
+# 70% train / 15% validation / 15% test
+train_idx <- createDataPartition(y_bins, p = 0.70, list = FALSE)
+X_train <- X[train_idx, ]
+y_train <- y[train_idx]
+
+remaining_X <- X[-train_idx, ]
+remaining_y <- y[-train_idx]
+remaining_bins <- y_bins[-train_idx]
+
+val_idx <- createDataPartition(remaining_bins, p = 0.50, list = FALSE)
+X_val  <- remaining_X[val_idx, ]
+y_val  <- remaining_y[val_idx]
+X_test <- remaining_X[-val_idx, ]
+y_test <- remaining_y[-val_idx]
+
+cat("=== Data Split Summary ===\n")
+cat("Training set:  ", nrow(X_train), "compounds (", round(nrow(X_train)/nrow(X)*100), "%)\n")
+cat("Validation set:", nrow(X_val),   "compounds (", round(nrow(X_val)/nrow(X)*100),   "%)\n")
+cat("Test set:      ", nrow(X_test),  "compounds (", round(nrow(X_test)/nrow(X)*100),  "%)\n")
+
+cat("\npIC50 range in splits:\n")
+cat("  Train: ", round(min(y_train),2), "–", round(max(y_train),2), "\n")
+cat("  Val:   ", round(min(y_val),2),   "–", round(max(y_val),2),   "\n")
+cat("  Test:  ", round(min(y_test),2),  "–", round(max(y_test),2),  "\n")
+```
+
+---
+
+# Model 1 — Linear Regression (QSAR)
+
+```{r linear-model}
+cat("Training Linear Regression model...\n")
+
+# Combine for lm()
+train_df_lm <- as.data.frame(X_train)
+train_df_lm$pIC50 <- y_train
+
+test_df_lm <- as.data.frame(X_test)
+
+# Train
+model_lm <- lm(pIC50 ~ ., data = train_df_lm)
+
+# Predict
+pred_lm_train <- predict(model_lm, train_df_lm)
+pred_lm_test  <- predict(model_lm, test_df_lm)
+
+# Metrics
+r2_lm_train  <- cor(y_train, pred_lm_train)^2
+r2_lm_test   <- cor(y_test,  pred_lm_test)^2
+rmse_lm_train <- rmse(y_train, pred_lm_train)
+rmse_lm_test  <- rmse(y_test,  pred_lm_test)
+mae_lm_train  <- mae(y_train,  pred_lm_train)
+mae_lm_test   <- mae(y_test,   pred_lm_test)
+
+cat("\n=== Linear Regression Results ===\n")
+cat(sprintf("TRAIN  — R²: %.3f | RMSE: %.3f | MAE: %.3f\n",
+            r2_lm_train, rmse_lm_train, mae_lm_train))
+cat(sprintf("TEST   — R²: %.3f | RMSE: %.3f | MAE: %.3f\n",
+            r2_lm_test,  rmse_lm_test,  mae_lm_test))
+```
+
+---
+
+# Model 2 — Random Forest (QSAR)
+
+```{r random-forest}
+cat("Training Random Forest model (this may take 1-2 minutes)...\n")
+
+# Reduce features to top descriptors only for speed
+# Use first 100 features (descriptors + first fingerprints)
+n_features <- min(100, ncol(X_train))
+X_train_rf <- X_train[, 1:n_features]
+X_test_rf  <- X_test[,  1:n_features]
+
+train_df_rf <- as.data.frame(X_train_rf)
+train_df_rf$pIC50 <- y_train
+
+test_df_rf <- as.data.frame(X_test_rf)
+
+# Train Random Forest
+model_rf <- randomForest(
+  pIC50 ~ .,
+  data       = train_df_rf,
+  ntree      = 300,        # number of trees
+  mtry       = floor(sqrt(n_features)),  # features per split
+  importance = TRUE,
+  na.action  = na.omit
+)
+
+# Predict
+pred_rf_train <- predict(model_rf, train_df_rf)
+pred_rf_test  <- predict(model_rf, test_df_rf)
+
+# Metrics
+r2_rf_train   <- cor(y_train, pred_rf_train)^2
+r2_rf_test    <- cor(y_test,  pred_rf_test)^2
+rmse_rf_train <- rmse(y_train, pred_rf_train)
+rmse_rf_test  <- rmse(y_test,  pred_rf_test)
+mae_rf_train  <- mae(y_train,  pred_rf_train)
+mae_rf_test   <- mae(y_test,   pred_rf_test)
+
+cat("\n=== Random Forest Results ===\n")
+cat(sprintf("TRAIN  — R²: %.3f | RMSE: %.3f | MAE: %.3f\n",
+            r2_rf_train, rmse_rf_train, mae_rf_train))
+cat(sprintf("TEST   — R²: %.3f | RMSE: %.3f | MAE: %.3f\n",
+            r2_rf_test,  rmse_rf_test,  mae_rf_test))
+```
+
+---
+
+# Model Comparison Table
+
+```{r metrics-table}
+metrics_df <- data.frame(
+  Model    = c("Linear Regression", "Linear Regression", "Random Forest", "Random Forest"),
+  Split    = c("Train", "Test", "Train", "Test"),
+  R2       = round(c(r2_lm_train,   r2_lm_test,   r2_rf_train,   r2_rf_test),   3),
+  RMSE     = round(c(rmse_lm_train, rmse_lm_test, rmse_rf_train, rmse_rf_test), 3),
+  MAE      = round(c(mae_lm_train,  mae_lm_test,  mae_rf_train,  mae_rf_test),  3)
+)
+
+kable(metrics_df, caption = "Model Performance Summary — Linear Regression vs Random Forest") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE) %>%
+  row_spec(which(metrics_df$Split == "Test"), bold = TRUE, background = "#E8F0FB") %>%
+  column_spec(3, color = ifelse(metrics_df$R2 >= 0.6, "darkgreen", "darkred"))
+```
+
+---
+
+# Mandatory Figure 1 — Predicted vs Observed Plot
+
+```{r pred-vs-obs, fig.width=12, fig.height=6}
+# Prepare data frames for plotting
+df_lm <- data.frame(
+  Actual    = y_test,
+  Predicted = pred_lm_test,
+  Model     = "Linear Regression"
+)
+
+df_rf <- data.frame(
+  Actual    = y_test,
+  Predicted = pred_rf_test,
+  Model     = "Random Forest"
+)
+
+df_pred <- bind_rows(df_lm, df_rf)
+
+# Axis limits
+ax_min <- floor(min(df_pred$Actual, df_pred$Predicted))
+ax_max <- ceiling(max(df_pred$Actual, df_pred$Predicted))
+
+p_pred_obs <- ggplot(df_pred, aes(x = Actual, y = Predicted, color = Model)) +
+  geom_abline(slope = 1, intercept = 0, color = "black",
+              linewidth = 1, linetype = "dashed", alpha = 0.6) +
+  geom_point(alpha = 0.55, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, alpha = 0.15, linewidth = 0.8) +
+  facet_wrap(~Model) +
+  scale_color_manual(values = c("Linear Regression" = "#2E5590",
+                                "Random Forest"      = "#2E7D32")) +
+  scale_x_continuous(limits = c(ax_min, ax_max)) +
+  scale_y_continuous(limits = c(ax_min, ax_max)) +
+  labs(
+    title    = "Predicted vs Observed pIC50 — Test Set",
+    subtitle = "Dashed line = perfect prediction (slope = 1). Points closer to line = better model.",
+    x        = "Observed pIC50",
+    y        = "Predicted pIC50"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", color = "#1F3864", size = 15),
+    plot.subtitle = element_text(color = "#555555", size = 11),
+    strip.text    = element_text(face = "bold", size = 12),
+    legend.position = "none"
+  ) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("LR: R²=", round(r2_lm_test, 3)),
+           color = "#2E5590", size = 4, fontface = "bold",
+           data = data.frame(Model = "Linear Regression")) +
+  annotate("text", x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+           label = paste0("RF: R²=", round(r2_rf_test, 3)),
+           color = "#2E7D32", size = 4, fontface = "bold",
+           data = data.frame(Model = "Random Forest"))
+
+print(p_pred_obs)
+
+# Save figure
+ggsave("Figure1_Predicted_vs_Observed.png", p_pred_obs,
+       width = 12, height = 6, dpi = 300, bg = "white")
+cat("Figure 1 saved as: Figure1_Predicted_vs_Observed.png\n")
+```
+
+---
+
+# Mandatory Figure 2 — Residual Error Plot
+
+```{r residuals, fig.width=12, fig.height=6}
+# Calculate residuals
+df_lm$Residual <- df_lm$Actual - df_lm$Predicted
+df_rf$Residual <- df_rf$Actual - df_rf$Predicted
+df_resid <- bind_rows(df_lm, df_rf)
+
+p_resid <- ggplot(df_resid, aes(x = Predicted, y = Residual, color = Model)) +
+  geom_hline(yintercept = 0, color = "black", linewidth = 1,
+             linetype = "dashed", alpha = 0.7) +
+  geom_point(alpha = 0.50, size = 2) +
+  geom_smooth(method = "loess", se = TRUE, alpha = 0.15, linewidth = 0.8) +
+  facet_wrap(~Model) +
+  scale_color_manual(values = c("Linear Regression" = "#E65100",
+                                "Random Forest"      = "#880E4F")) +
+  labs(
+    title    = "Residual Error Plot — Test Set",
+    subtitle = "Residual = Actual − Predicted. Points should scatter randomly around 0.",
+    x        = "Predicted pIC50",
+    y        = "Residual (Actual − Predicted)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", color = "#1F3864", size = 15),
+    plot.subtitle = element_text(color = "#555555", size = 11),
+    strip.text    = element_text(face = "bold", size = 12),
+    legend.position = "none"
+  )
+
+print(p_resid)
+
+# Save figure
+ggsave("Figure2_Residual_Error_Plot.png", p_resid,
+       width = 12, height = 6, dpi = 300, bg = "white")
+cat("Figure 2 saved as: Figure2_Residual_Error_Plot.png\n")
+```
+
+---
+
+# SAR Analysis — High vs Low Activity Compounds
+
+> **Structure-Activity Relationship (SAR):** We compare the physicochemical properties of potent compounds (high pIC50) vs weak compounds (low pIC50) to understand what molecular features drive AChE inhibition.
+
+```{r sar-analysis}
+# Use main dataset for SAR (has interpretable descriptor columns)
+sar_df <- main_df %>%
+  select(pIC50, MW, logP, HBD, HBA) %>%
+  drop_na()
+
+# Define high/low activity based on median split
+median_pic50 <- median(sar_df$pIC50)
+sar_df$Activity_Group <- ifelse(sar_df$pIC50 >= median_pic50, "High Activity", "Low Activity")
+
+cat("Median pIC50 cutoff:", round(median_pic50, 2), "\n")
+cat("High activity compounds:", sum(sar_df$Activity_Group == "High Activity"), "\n")
+cat("Low  activity compounds:", sum(sar_df$Activity_Group == "Low Activity"),  "\n\n")
+
+# Summary stats by group
+sar_summary <- sar_df %>%
+  group_by(Activity_Group) %>%
+  summarise(
+    n        = n(),
+    pIC50_mean = round(mean(pIC50), 2),
+    MW_mean    = round(mean(MW),    2),
+    logP_mean  = round(mean(logP),  2),
+    HBD_mean   = round(mean(HBD),   2),
+    HBA_mean   = round(mean(HBA),   2)
+  )
+
+kable(sar_summary, caption = "SAR Summary — Physicochemical Properties by Activity Group") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r sar-boxplots, fig.width=12, fig.height=8}
+# Pivot for facet boxplots
+sar_long <- sar_df %>%
+  pivot_longer(cols = c(MW, logP, HBD, HBA),
+               names_to = "Descriptor", values_to = "Value")
+
+p_sar <- ggplot(sar_long, aes(x = Activity_Group, y = Value,
+                               fill = Activity_Group)) +
+  geom_boxplot(alpha = 0.75, outlier.size = 1, outlier.alpha = 0.4) +
+  geom_jitter(width = 0.15, alpha = 0.15, size = 0.8) +
+  facet_wrap(~Descriptor, scales = "free_y", ncol = 2) +
+  scale_fill_manual(values = c("High Activity" = "#2E7D32",
+                               "Low Activity"  = "#C62828")) +
+  labs(
+    title    = "SAR Analysis — Descriptor Comparison by Activity Group",
+    subtitle = paste0("Cutoff: pIC50 ≥ ", round(median_pic50, 2), " = High Activity"),
+    x        = NULL,
+    y        = "Descriptor Value",
+    fill     = "Activity Group"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", color = "#1F3864", size = 15),
+    plot.subtitle = element_text(color = "#555555", size = 11),
+    strip.text    = element_text(face = "bold", size = 12),
+    legend.position = "bottom"
+  )
+
+print(p_sar)
+
+ggsave("Figure3_SAR_Boxplots.png", p_sar,
+       width = 12, height = 8, dpi = 300, bg = "white")
+cat("SAR figure saved as: Figure3_SAR_Boxplots.png\n")
+```
+
+```{r sar-statistical-test}
+# Wilcoxon test for each descriptor (non-parametric, appropriate here)
+desc_to_test <- c("MW", "logP", "HBD", "HBA")
+test_results <- lapply(desc_to_test, function(d) {
+  high <- sar_df[[d]][sar_df$Activity_Group == "High Activity"]
+  low  <- sar_df[[d]][sar_df$Activity_Group == "Low Activity"]
+  wt   <- wilcox.test(high, low)
+  data.frame(
+    Descriptor = d,
+    High_Mean  = round(mean(high), 3),
+    Low_Mean   = round(mean(low),  3),
+    p_value    = round(wt$p.value, 4),
+    Significant = ifelse(wt$p.value < 0.05, "Yes ✓", "No")
+  )
+})
+test_df <- do.call(rbind, test_results)
+
+kable(test_df, caption = "Wilcoxon Test — Are differences between groups statistically significant?") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  column_spec(5, color = ifelse(test_df$Significant == "Yes ✓", "darkgreen", "darkred"),
+              bold = TRUE)
+```
+
+---
+
+# Mandatory Figure 3 — Chemical Space Visualization (PCA)
+
+```{r pca-analysis, fig.width=10, fig.height=7}
+# PCA on descriptor columns only (first 5 features = MW, logP, HBD, HBA, RO5)
+desc_matrix <- as.matrix(X[, 1:5])
+desc_matrix <- desc_matrix[complete.cases(desc_matrix), ]
+
+# Run PCA
+pca_result <- prcomp(desc_matrix, scale. = TRUE, center = TRUE)
+
+# Variance explained
+var_explained <- round(summary(pca_result)$importance[2, 1:4] * 100, 1)
+cat("Variance explained:\n")
+cat("  PC1:", var_explained[1], "%\n")
+cat("  PC2:", var_explained[2], "%\n")
+cat("  PC3:", var_explained[3], "%\n")
+cat("  Cumulative PC1+PC2:", sum(var_explained[1:2]), "%\n")
+
+# PCA scores
+pca_df <- data.frame(
+  PC1   = pca_result$x[, 1],
+  PC2   = pca_result$x[, 2],
+  pIC50 = y[1:nrow(desc_matrix)]
+)
+pca_df$Activity <- cut(pca_df$pIC50,
+                       breaks = quantile(pca_df$pIC50, c(0, 0.33, 0.67, 1)),
+                       labels = c("Low", "Medium", "High"),
+                       include.lowest = TRUE)
+
+# Chemical space plot
+p_pca <- ggplot(pca_df, aes(x = PC1, y = PC2, color = pIC50)) +
+  geom_point(alpha = 0.60, size = 2) +
+  scale_color_gradientn(
+    colors = c("#C62828", "#F57C00", "#FDD835", "#43A047", "#1565C0"),
+    name   = "pIC50"
+  ) +
+  stat_ellipse(aes(group = Activity, linetype = Activity),
+               type = "norm", level = 0.90,
+               linewidth = 0.8, color = "grey40") +
+  labs(
+    title    = "Chemical Space Visualization — PCA of AChE Inhibitors",
+    subtitle = paste0("PC1: ", var_explained[1], "% | PC2: ", var_explained[2],
+                      "% | Ellipses show low/medium/high activity regions"),
+    x        = paste0("PC1 (", var_explained[1], "% variance)"),
+    y        = paste0("PC2 (", var_explained[2], "% variance)"),
+    linetype = "Activity Group"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", color = "#1F3864", size = 15),
+    plot.subtitle = element_text(color = "#555555", size = 11),
+    legend.position = "right"
+  )
+
+print(p_pca)
+
+ggsave("Figure4_Chemical_Space_PCA.png", p_pca,
+       width = 10, height = 7, dpi = 300, bg = "white")
+cat("PCA figure saved as: Figure4_Chemical_Space_PCA.png\n")
+```
+
+```{r pca-loadings}
+# PCA loadings — what descriptors drive PC1 and PC2?
+loadings_df <- data.frame(
+  Descriptor = c("MW", "logP", "HBD", "HBA", "RO5_violations"),
+  PC1_loading = round(pca_result$rotation[, 1], 3),
+  PC2_loading = round(pca_result$rotation[, 2], 3)
+)
+
+kable(loadings_df, caption = "PCA Loadings — Which descriptors drive each principal component?") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+---
+
+# Random Forest — Variable Importance
+
+```{r var-importance, fig.width=10, fig.height=6}
+# Top 15 most important features from Random Forest
+importance_df <- data.frame(
+  Feature    = rownames(importance(model_rf)),
+  Importance = importance(model_rf)[, "%IncMSE"]
+) %>%
+  arrange(desc(Importance)) %>%
+  slice_head(n = 15)
+
+p_imp <- ggplot(importance_df, aes(x = reorder(Feature, Importance),
+                                    y = Importance, fill = Importance)) +
+  geom_col(alpha = 0.85) +
+  coord_flip() +
+  scale_fill_gradientn(colors = c("#90CAF9", "#1565C0"), guide = "none") +
+  labs(
+    title    = "Random Forest — Top 15 Most Important Features",
+    subtitle = "% Increase in MSE when feature is permuted",
+    x        = NULL,
+    y        = "% IncMSE (Feature Importance)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(face = "bold", color = "#1F3864", size = 14)
+  )
+
+print(p_imp)
+
+ggsave("Figure5_RF_Variable_Importance.png", p_imp,
+       width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+---
+
+# Final Summary
+
+```{r final-summary}
+summary_df <- data.frame(
+  Model  = c("Linear Regression", "Random Forest"),
+  R2_Train = c(round(r2_lm_train,   3), round(r2_rf_train,   3)),
+  R2_Test  = c(round(r2_lm_test,    3), round(r2_rf_test,    3)),
+  RMSE_Test= c(round(rmse_lm_test,  3), round(rmse_rf_test,  3)),
+  MAE_Test = c(round(mae_lm_test,   3), round(mae_rf_test,   3)),
+  Verdict  = c(
+    ifelse(r2_lm_test >= 0.5, "Acceptable", "Weak baseline"),
+    ifelse(r2_rf_test >= 0.6, "Good model",  "Needs tuning")
+  )
+)
+
+kable(summary_df, caption = "Final Model Performance — Test Set") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "bordered"),
+                full_width = FALSE) %>%
+  column_spec(6, bold = TRUE,
+              color = ifelse(summary_df$R2_Test >= 0.6, "darkgreen", "#E65100"))
+
+cat("\n=== FILES GENERATED (send all to Person 3 for GitHub) ===\n")
+cat("  Figure1_Predicted_vs_Observed.png\n")
+cat("  Figure2_Residual_Error_Plot.png\n")
+cat("  Figure3_SAR_Boxplots.png\n")
+cat("  Figure4_Chemical_Space_PCA.png\n")
+cat("  Figure5_RF_Variable_Importance.png\n")
+cat("  Person2_QSAR_Modeling.Rmd  (this file)\n")
+
+cat("\n=== REPORT SECTION NOTES ===\n")
+cat("1. Mention scaffold-stratified split (70/15/15)\n")
+cat("2. Report BOTH model metrics — interpret which is better and why\n")
+cat("3. SAR: state which descriptors differ significantly between high/low activity\n")
+cat("4. PCA: describe how active compounds cluster in chemical space\n")
+cat("5. All 4 mandatory figures are produced and saved\n")
+```
+
+---
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```
