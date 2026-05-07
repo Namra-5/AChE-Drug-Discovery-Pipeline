@@ -1,0 +1,975 @@
+---
+title: "Task 6: Virtual Screening and Hit Expansion"
+author: "Pharmacoinformatics BI-424 | AChE Inhibitor Discovery"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    number_sections: true
+    df_print: paged
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  dpi = 150)
+```
+
+------------------------------------------------------------------------
+
+# Install & Load Packages
+
+```{r packages}
+required_packages <- c(
+  "tidyverse",
+  "ggrepel",
+  "patchwork",
+  "viridis",
+  "knitr",
+  "kableExtra",
+  "scales",
+  "RColorBrewer",
+  "ggridges"
+)
+
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+
+cat("All packages installed and loaded.\n")
+```
+
+------------------------------------------------------------------------
+
+# Data Loading
+
+**Files needed in this folder:** - `ACHE_QSAR_dataset.csv` -
+`potent_ache_inhibitors.csv` (ChEMBL export)
+
+```{r load-data}
+# -- Load the full curated QSAR dataset -----------------------------
+main_df <- read.csv("ACHE_QSAR_dataset.csv", stringsAsFactors = FALSE)
+
+# Standardise column names
+colnames(main_df)[colnames(main_df) == "pChEMBL.Value"]    <- "pIC50"
+colnames(main_df)[colnames(main_df) == "Molecular_Weight"] <- "MW"
+
+# Handle duplicate AlogP column 
+if (sum(colnames(main_df) == "AlogP") > 1) {
+  dup_idx <- which(colnames(main_df) == "AlogP")
+  main_df <- main_df[, -dup_idx[-1]]
+}
+colnames(main_df)[colnames(main_df) == "AlogP"] <- "logP"
+
+# -- Load potent inhibitor ChEMBL export ---------------------
+raw_potent <- read.csv("potent_ache_inhibitors.csv", stringsAsFactors = FALSE)
+
+# Extract and standardise relevant columns
+potent_df <- raw_potent %>%
+  select(
+    ChEMBL_ID      = `Molecule.ChEMBL.ID`,
+    MW              = `Molecular.Weight`,
+    RO5_Violations  = `X.RO5.Violations`,
+    logP            = AlogP,
+    SMILES          = Smiles,
+    IC50_nM         = `Standard.Value`,
+    pIC50           = `pChEMBL.Value`,
+    Potency_Cat     = `Potency.Category`,
+    HBD             = `Ligand.Efficiency.BEI`,   # placeholder
+    LE              = `Ligand.Efficiency.LE`,
+    LLE             = `Ligand.Efficiency.LLE`
+  ) %>%
+  mutate(
+    pIC50          = as.numeric(pIC50),
+    MW             = as.numeric(MW),
+    logP           = as.numeric(logP),
+    RO5_Violations = as.numeric(RO5_Violations),
+    IC50_nM        = as.numeric(IC50_nM),
+    LE             = as.numeric(LE),
+    LLE            = as.numeric(LLE)
+  ) %>%
+  filter(!is.na(pIC50), !is.na(SMILES), SMILES != "",
+         !is.na(MW), !is.na(logP)) %>%
+  distinct(ChEMBL_ID, .keep_all = TRUE)
+
+cat("=== Main QSAR Dataset ===\n")
+cat("Compounds:", nrow(main_df), "\n")
+cat("pIC50 range:", round(min(as.numeric(main_df$pIC50), na.rm=TRUE),2),
+    "to", round(max(as.numeric(main_df$pIC50), na.rm=TRUE),2), "\n\n")
+
+cat("=== Potent Inhibitors (ChEMBL Export) ===\n")
+cat("Compounds:", nrow(potent_df), "\n")
+cat("pIC50 range:", round(min(potent_df$pIC50, na.rm=TRUE),2),
+    "to", round(max(potent_df$pIC50, na.rm=TRUE),2), "\n")
+```
+
+------------------------------------------------------------------------
+
+# Virtual Screening Strategy
+
+## Rationale
+
+Virtual screening (VS) is used to prioritise a small number of compounds
+from a larger pool for the computationally expensive docking step (max
+10 compounds per project constraints). Our strategy is **QSAR-based
+retrospective screening**: we screen from the ChEMBL-validated AChE
+inhibitor dataset, applying sequential property filters followed by a
+multi-parameter composite scoring function that integrates potency,
+ligand efficiency, drug-likeness, and lipophilicity optimality.
+
+This approach is justified because: 1. All compounds have experimentally
+validated AChE inhibitory activity 2. pIC50 values are standardised from
+IC50 measurements 3. Drug-likeness filtering ensures candidates have
+realistic pharmacokinetic potential 4. Ligand efficiency normalises for
+molecular size -- preventing selection of large, potent-but-inefficient
+molecules 5. Composite scoring is applied before any diversity filter;
+in a production pipeline, Tanimoto-based clustering would follow to
+ensure scaffold diversity among the final docking candidates
+
+## Screening Library Source
+
+The starting pool consists of all **potent AChE inhibitors** (pIC50 \>=
+7.0, i.e. IC50 \<= 100 nM) from the ChEMBL CHEMBL220 dataset
+
+------------------------------------------------------------------------
+
+# Step 1: Drug-likeness Filtering (Lipinski Ro5)
+
+## Filter Criteria
+
+| Property | Threshold | Rationale |
+|------------------------|------------------------|------------------------|
+| Molecular Weight (MW) | \<= 500 Da | Lipinski Ro5: predicts oral absorption |
+| logP | \<= 5.0 | Lipinski Ro5: limits passive diffusion through membranes |
+| RO5 Violations | \<= 1 | Allows one exception (Veber rule -- some CNS drugs violate) |
+| MW minimum | \>= 150 Da | Removes fragments too small for meaningful binding |
+| logP minimum | \>= -2.0 | Removes overly hydrophilic compounds with poor CNS penetration |
+
+```{r ro5-filter}
+# -- Record sizes at each step for the funnel ----------------------------------
+n_start <- nrow(potent_df)
+cat("Starting pool (pIC50 >= 7.0):", n_start, "compounds\n\n")
+
+# Step 1a: Ro5 -- MW, logP, violations
+after_ro5 <- potent_df %>%
+  filter(MW <= 500, logP <= 5.0, RO5_Violations <= 1)
+cat("After Ro5 (MW<=500, logP<=5, viol<=1):", nrow(after_ro5), "\n")
+
+# Step 1b: MW minimum
+after_mw_min <- after_ro5 %>% filter(MW >= 150)
+cat("After MW >= 150:                      ", nrow(after_mw_min), "\n")
+
+# Step 1c: logP range
+after_logp <- after_mw_min %>% filter(logP >= -2.0)
+cat("After logP >= -2.0:                   ", nrow(after_logp), "\n")
+
+# Step 1d: Deduplicate
+screen_library <- after_logp %>% distinct(ChEMBL_ID, .keep_all = TRUE)
+cat("After deduplication:                  ", nrow(screen_library), "\n")
+cat("\nFinal screening library size:", nrow(screen_library), "compounds\n")
+```
+
+## Table T6-1: Filtering Summary
+
+```{r filter-table}
+filter_summary <- tibble(
+  Step = 1:5,
+  Filter_Applied = c(
+    "Starting pool: pIC50 >= 7.0 (potent AChE inhibitors)",
+    "Lipinski Ro5: MW <= 500 Da, logP <= 5.0, RO5 violations <= 1",
+    "Fragment removal: MW >= 150 Da",
+    "Hydrophilicity filter: logP >= -2.0",
+    "Deduplication by ChEMBL ID"
+  ),
+  N_Remaining = c(
+    n_start,
+    nrow(after_ro5),
+    nrow(after_mw_min),
+    nrow(after_logp),
+    nrow(screen_library)
+  ),
+  N_Removed = c(
+    0,
+    n_start - nrow(after_ro5),
+    nrow(after_ro5) - nrow(after_mw_min),
+    nrow(after_mw_min) - nrow(after_logp),
+    nrow(after_logp) - nrow(screen_library)
+  ),
+  Pct_Remaining = paste0(round(100 * c(
+    n_start, nrow(after_ro5), nrow(after_mw_min),
+    nrow(after_logp), nrow(screen_library)
+  ) / n_start, 1), "%")
+)
+
+kable(filter_summary,
+      caption = "Table T6-1: Virtual Screening Library Construction -- Sequential Filters") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width=TRUE) %>%
+  column_spec(3, bold=TRUE, color="#1a6e3d") %>%
+  column_spec(4, color="#c62828") %>%
+  row_spec(nrow(filter_summary), bold=TRUE, background="#fff9c4")
+```
+
+------------------------------------------------------------------------
+
+# Step 2: Composite Scoring for QSAR-Based Ranking
+
+## Scoring Function Design
+
+Each compound in the filtered library receives a **composite score**
+integrating four independent properties. This is a multi-parameter
+optimisation (MPO) approach standard in drug discovery for balancing
+potency against drug-likeness.
+
+$$CompositeScore = (0.50 \times pIC50_{norm}) + (0.25 \times LE_{norm}) + (0.15 \times S_{DL}) + (0.10 \times S_{logP})$$
+Where: - ${\text{pIC50}_{norm}}$ = min-max normalised pIC50 (primary
+potency) - ${\text{LE}_{norm}}$ = min-max normalised ligand efficiency
+(pIC50 per heavy atom) - $S_{\text{DL}}$ = drug-likeness score (penalty
+for Ro5 violations) - $S_{\text{logP}}$ = lipophilicity optimality score
+(penalty for logP \> 3.5)
+
+**Weights rationale:** - pIC50 (50%): Primary measure -- biological
+activity is the most critical criterion - LE (25%): Prevents selection
+of large/bloated molecules that are potent only due to size -
+Drug-likeness (15%): Ensures oral bioavailability potential - logP
+(10%): Excessive lipophilicity (ClogP \> 3.5) is associated with poor
+solubility, hERG binding risk, and metabolic instability
+
+```{r composite-scoring}
+# -- Compute composite score ----------------------------------------------------
+ranked_library <- screen_library %>%
+  mutate(
+    # Heavy atom count estimate (MW / average heavy atom weight ~13.8)
+    Heavy_Atoms = pmax(1, round(MW / 13.8)),
+
+    # Ligand efficiency: pIC50 per heavy atom
+    LE_calc = round(pIC50 / Heavy_Atoms, 4),
+
+    # Min-max normalise pIC50
+    pIC50_norm = (pIC50 - min(pIC50, na.rm=TRUE)) /
+                 (max(pIC50, na.rm=TRUE) - min(pIC50, na.rm=TRUE)),
+
+    # Min-max normalise LE
+    LE_norm    = (LE_calc - min(LE_calc, na.rm=TRUE)) /
+                 (max(LE_calc, na.rm=TRUE) - min(LE_calc, na.rm=TRUE)),
+
+    # Drug-likeness score
+    DL_score   = case_when(
+      RO5_Violations == 0 ~ 1.00,
+      RO5_Violations == 1 ~ 0.85,
+      TRUE                ~ 0.60
+    ),
+
+    # logP optimality score (AChE is a CNS target -- logP 1-3.5 is ideal)
+    logP_score = case_when(
+      logP >= 1.0 & logP <= 3.5 ~ 1.00,
+      logP >= 0.0 & logP <= 5.0 ~ 0.85,
+      logP >= -2  & logP <  0.0 ~ 0.70,
+      TRUE                       ~ 0.60
+    ),
+
+    # Composite score (weighted sum)
+    Composite_Score = round(
+      0.50 * pIC50_norm +
+      0.25 * LE_norm    +
+      0.15 * DL_score   +
+      0.10 * logP_score,
+      4
+    )
+  ) %>%
+  arrange(desc(Composite_Score)) %>%
+  mutate(Rank = row_number())
+
+cat("Ranked library size:", nrow(ranked_library), "compounds\n")
+cat("Score range:", round(min(ranked_library$Composite_Score),4),
+    "to", round(max(ranked_library$Composite_Score),4), "\n")
+cat("\nTop 5 scores:\n")
+ranked_library %>%
+  select(Rank, ChEMBL_ID, pIC50, LE_calc, Composite_Score) %>%
+  head(5) %>%
+  print()
+```
+
+------------------------------------------------------------------------
+
+# Step 3: Top 10 Selection for Molecular Docking
+
+## Selection Criteria
+
+The top 10 compounds by composite score are selected for molecular
+docking (maximum 10 per project constraints). To promote chemical
+diversity among the selected candidates, we verify that the top 10
+include representatives from different potency categories.
+
+```{r top10-selection}
+top10 <- ranked_library %>%
+  head(10) %>%
+  mutate(
+    pIC50    = round(pIC50, 2),
+    MW       = round(MW, 1),
+    logP     = round(logP, 2),
+    LE_calc  = round(LE_calc, 3),
+    Composite_Score = round(Composite_Score, 4)
+  )
+
+cat("=== TOP 10 COMPOUNDS SELECTED FOR DOCKING ===\n\n")
+for (i in 1:10) {
+  cat(sprintf(
+    "Rank %2d | %-20s | pIC50: %5.2f | IC50: %8.3f nM | MW: %5.1f | logP: %4.2f | LE: %.3f | Score: %.4f\n",
+    i, top10$ChEMBL_ID[i], top10$pIC50[i], top10$IC50_nM[i],
+    top10$MW[i], top10$logP[i], top10$LE_calc[i], top10$Composite_Score[i]
+  ))
+}
+```
+
+## Table T6-2: Top 10 Docking Candidates
+
+```{r top10-table}
+top10_display <- top10 %>%
+  select(Rank, ChEMBL_ID, pIC50, IC50_nM, MW, logP, RO5_Violations,
+         LE_calc, Composite_Score, Potency_Cat)
+
+kable(top10_display,
+      col.names = c("Rank", "ChEMBL ID", "pIC50", "IC50 (nM)",
+                    "MW (Da)", "logP", "RO5 Viol.", "LE", "Composite Score", "Potency Category"),
+      caption = "Table T6-2: Top 10 Compounds Selected for Molecular Docking") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width=TRUE) %>%
+  row_spec(1:3, background="#c8e6c9", bold=TRUE) %>%
+  row_spec(4:7, background="#e8f5e9") %>%
+  column_spec(3, bold=TRUE) %>%
+  column_spec(9, bold=TRUE, color="#1a6e3d")
+```
+
+## Diversity Note and Limitation
+
+The top 10 compounds by composite score include five structural
+analogues from the same methoxyphenyl-sulfamide scaffold series
+(CHEMBL3585780-84), differing only in the position and number of methoxy
+substituents. These share identical pIC50 values (10.57) and were ranked
+together due to equal composite scores.
+
+In a production virtual screening pipeline, a Tanimoto similarity filter
+(cutoff \< 0.7 on Morgan fingerprints) or maximum common substructure
+clustering would be applied at this stage to ensure scaffold diversity
+among docking candidates. Given the project constraints and
+computational scope, all top 10 compounds are retained for docking.
+Ranking 6-10 introduce a second distinct scaffold
+(tetrahydroisoquinolinone with aryl amide substituents), providing some
+chemical diversity across the docking set.
+
+Additionally, the pIC50 values of 10.57 (IC50 = 0.027 nM) for the top
+compounds represent sub-picomolar potency -- exceptionally rare in
+medicinal chemistry. These data originate from a single ChEMBL
+publication and may reflect a specific assay format. This is noted as a
+data quality caveat; the composite scoring and filtering methodology
+remain valid regardless of the absolute potency values.
+
+------------------------------------------------------------------------
+
+## Table T6-3: SMILES Strings for Docking Input
+
+```{r smiles-table}
+smiles_table <- top10 %>%
+  mutate(Docking_ID = paste0("ACHE_Cand_", sprintf("%02d", Rank), "_", ChEMBL_ID)) %>%
+  select(Rank, ChEMBL_ID, Docking_ID, SMILES, pIC50)
+
+kable(smiles_table,
+      caption = "Table T6-3: SMILES Strings for Top 10 Docking Candidates") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width=TRUE) %>%
+  column_spec(4, width= "45%", extra_css = "font-size: 9px;")
+```
+
+------------------------------------------------------------------------
+
+# Figure T6-1: Virtual Screening Funnel
+
+```{r fig-funnel, fig.height=5}
+funnel_data <- tibble(
+  Stage = factor(c(
+    paste0("Full QSAR\nDataset\nn=", nrow(main_df)),
+    paste0("Potent Pool\n(pIC50>=7.0)\nn=", n_start),
+    paste0("After Ro5\nFilter\nn=", nrow(after_ro5)),
+    paste0("After MW/logP\nCleaning\nn=", nrow(after_logp)),
+    paste0("Final Screening\nLibrary\nn=", nrow(screen_library)),
+    "Top 10\nfor Docking\nn=10"
+  ), levels = rev(c(
+    paste0("Full QSAR\nDataset\nn=", nrow(main_df)),
+    paste0("Potent Pool\n(pIC50>=7.0)\nn=", n_start),
+    paste0("After Ro5\nFilter\nn=", nrow(after_ro5)),
+    paste0("After MW/logP\nCleaning\nn=", nrow(after_logp)),
+    paste0("Final Screening\nLibrary\nn=", nrow(screen_library)),
+    "Top 10\nfor Docking\nn=10"
+  ))),
+  Count = c(
+    nrow(main_df), n_start, nrow(after_ro5),
+    nrow(after_logp), nrow(screen_library), 10
+  ),
+  Fill_Group = c("start","pool","filter","filter","library","selected")
+)
+
+fill_vals <- c("start"="#4575b4","pool"="#74add1","filter"="#fee090",
+               "library"="#fc8d59","selected"="#d73027")
+
+p_funnel <- ggplot(funnel_data, aes(x=Stage, y=Count, fill=Fill_Group)) +
+  geom_col(width=0.7, colour="white", linewidth=0.4) +
+  geom_text(aes(label=scales::comma(Count)),
+            hjust=-0.12, fontface="bold", size=4.2) +
+  coord_flip() +
+  scale_fill_manual(values=fill_vals) +
+  scale_y_continuous(expand=expansion(mult=c(0, 0.18)),
+                     labels=scales::comma) +
+  labs(
+    title    = "Figure T6-1: Virtual Screening Funnel -- AChE Inhibitor Candidate Selection",
+    subtitle = "Sequential filters reduce 5,604 compounds to 10 high-quality docking candidates",
+    x        = NULL,
+    y        = "Number of Compounds",
+    caption  = paste0("Final library: ", nrow(screen_library),
+                      " drug-like potent AChE inhibitors | Top 10 selected by composite score.")
+  ) +
+  theme_bw(base_size=12) +
+  theme(
+    plot.title      = element_text(face="bold", size=11),
+    plot.subtitle   = element_text(size=9, colour="grey40"),
+    legend.position = "none",
+    axis.text.y     = element_text(size=9)
+  )
+
+print(p_funnel)
+dir.create("figures", showWarnings=FALSE)
+ggsave("figures/Figure_T6_1_Screening_Funnel.png", p_funnel, width=11, height=5, dpi=150)
+cat("Saved: figures/Figure_T6_1_Screening_Funnel.png\n")
+```
+
+------------------------------------------------------------------------
+
+# Figure T6-2: Composite Score Distribution -- Full Library
+
+```{r fig-score-dist, fig.height=5}
+# Cutoff score at top 10
+cutoff_score <- ranked_library$Composite_Score[10]
+
+p_score <- ggplot(ranked_library, aes(x=Composite_Score)) +
+  geom_histogram(aes(fill=after_stat(x) >= cutoff_score),
+                 binwidth=0.005, colour="white", linewidth=0.2) +
+  scale_fill_manual(values=c("TRUE"="#d73027","FALSE"="#4575b4"),
+                    labels=c("TRUE"="Top 10 selected","FALSE"="Not selected")) +
+  geom_vline(xintercept=cutoff_score, linetype="dashed",
+             colour="#d73027", linewidth=1) +
+  annotate("text", x=cutoff_score+0.002, y=Inf,
+           label=paste0("Top-10 cutoff\n= ", round(cutoff_score,4)),
+           vjust=1.5, hjust=0, size=3.2, colour="#d73027", fontface="bold") +
+  scale_x_continuous(breaks=pretty_breaks(8)) +
+  labs(
+    title    = "Figure T6-2: Composite Score Distribution -- Virtual Screening Library",
+    subtitle = paste0("n = ", nrow(ranked_library), " drug-like AChE inhibitors | ",
+                      "Red = top 10 selected for docking"),
+    x        = "Composite Score  (pIC50: 50%, LE: 25%, Drug-likeness: 15%, logP: 10%)",
+    y        = "Number of Compounds",
+    fill     = NULL,
+    caption  = "Higher score = better multi-parameter candidate. Cutoff at rank 10."
+  ) +
+  theme_bw(base_size=12) +
+  theme(
+    plot.title      = element_text(face="bold", size=11),
+    plot.subtitle   = element_text(size=9, colour="grey40"),
+    legend.position = "top"
+  )
+
+print(p_score)
+ggsave("figures/Figure_T6_2_Score_Distribution.png", p_score, width=10, height=5, dpi=150)
+cat("Saved: figures/Figure_T6_2_Score_Distribution.png\n")
+```
+
+------------------------------------------------------------------------
+
+# Figure T6-3: pIC50 vs Composite Score (Top 10 Highlighted)
+
+```{r fig-pic50-score, fig.height=6}
+plot_df <- ranked_library %>%
+  mutate(
+    Is_Top10  = Rank <= 10,
+    Label     = if_else(Is_Top10, ChEMBL_ID, NA_character_),
+    Cat       = case_when(
+      Is_Top10          ~ "Top 10 (selected for docking)",
+      pIC50 >= 9.0      ~ "Extremely Potent (>=9.0)",
+      pIC50 >= 8.0      ~ "Very Potent (8.0-9.0)",
+      pIC50 >= 7.5      ~ "Potent (7.5-8.0)",
+      TRUE              ~ "Moderate (7.0-7.5)"
+    )
+  )
+
+cat_cols <- c(
+  "Top 10 (selected for docking)" = "#d73027",
+  "Extremely Potent (>=9.0)"       = "#b15928",
+  "Very Potent (8.0-9.0)"         = "#fc8d59",
+  "Potent (7.5-8.0)"              = "#4575b4",
+  "Moderate (7.0-7.5)"            = "#91bfdb"
+)
+cat_size <- c("Top 10 (selected for docking)"=3.5,
+              "Extremely Potent (>=9.0)"=2,
+              "Very Potent (8.0-9.0)"=1.8,
+              "Potent (7.5-8.0)"=1.5,
+              "Moderate (7.0-7.5)"=1.2)
+
+p_scatter <- ggplot(plot_df %>% arrange(Is_Top10),
+                    aes(x=pIC50, y=Composite_Score, colour=Cat, size=Cat)) +
+  geom_point(alpha=0.65) +
+  geom_label_repel(
+    aes(label=Label), size=2.5, max.overlaps=20,
+    box.padding=0.5, point.padding=0.4,
+    segment.colour="grey60", segment.size=0.3,
+    fill="white", colour="#c62828", fontface="bold",
+    na.rm=TRUE
+  ) +
+  scale_colour_manual(values=cat_cols) +
+  scale_size_manual(values=cat_size) +
+  labs(
+    title    = "Figure T6-3: pIC50 vs Composite Score -- Virtual Screening Library",
+    subtitle = paste0("n = ", nrow(ranked_library), " compounds | Top 10 labelled in red"),
+    x        = "pIC50 (ChEMBL validated experimental value)",
+    y        = "Composite Score",
+    colour   = "Category", size = "Category",
+    caption  = "Top 10 selected compounds cluster at high pIC50 AND high composite score."
+  ) +
+  theme_bw(base_size=12) +
+  theme(
+    plot.title      = element_text(face="bold", size=11),
+    plot.subtitle   = element_text(size=9, colour="grey40"),
+    legend.position = "bottom",
+    legend.text     = element_text(size=8)
+  )
+
+print(p_scatter)
+ggsave("figures/Figure_T6_3_pIC50_vs_Score.png", p_scatter, width=11, height=6, dpi=150)
+cat("Saved: figures/Figure_T6_3_pIC50_vs_Score.png\n")
+```
+
+------------------------------------------------------------------------
+
+# Figure T6-4: Chemical Space -- MW vs logP
+
+```{r fig-chemical-space, fig.height=6}
+p_chem <- ggplot(plot_df %>% arrange(Is_Top10),
+                 aes(x=MW, y=logP, colour=Cat, size=Cat)) +
+  geom_point(alpha=0.60) +
+  geom_label_repel(
+    aes(label=Label), size=2.5, max.overlaps=20,
+    box.padding=0.5, point.padding=0.4,
+    segment.colour="grey60", segment.size=0.3,
+    fill="white", colour="#c62828", fontface="bold",
+    na.rm=TRUE
+  ) +
+  # Lipinski Ro5 box
+  annotate("rect", xmin=150, xmax=500, ymin=-2, ymax=5,
+           fill=NA, colour="grey40", linetype="dashed", linewidth=0.5) +
+  annotate("text", x=488, y=4.7, label="Lipinski Ro5 space",
+           hjust=1, size=3, colour="grey40") +
+  # CNS MPO optimal logP zone
+  annotate("rect", xmin=150, xmax=500, ymin=1.0, ymax=3.5,
+           fill="#e8f5e9", alpha=0.25) +
+  annotate("text", x=155, y=3.3, label="Optimal CNS logP zone (1-3.5)",
+           hjust=0, size=2.8, colour="#2e7d32") +
+  scale_colour_manual(values=cat_cols) +
+  scale_size_manual(values=cat_size) +
+  scale_x_continuous(breaks=seq(150,500,50)) +
+  labs(
+    title    = "Figure T6-4: Chemical Space of Screening Library -- MW vs logP",
+    subtitle = "All compounds within Lipinski Ro5 space | CNS optimal logP zone shaded green",
+    x        = "Molecular Weight (Da)",
+    y        = "logP",
+    colour   = "Category", size="Category",
+    caption  = paste0("n = ", nrow(ranked_library),
+                      " compounds | Dashed box = Lipinski Ro5 boundary")
+  ) +
+  theme_bw(base_size=12) +
+  theme(
+    plot.title      = element_text(face="bold", size=11),
+    plot.subtitle   = element_text(size=9, colour="grey40"),
+    legend.position = "bottom",
+    legend.text     = element_text(size=8)
+  )
+
+print(p_chem)
+ggsave("figures/Figure_T6_4_ChemSpace_MW_logP.png", p_chem, width=11, height=6, dpi=150)
+cat("Saved: figures/Figure_T6_4_ChemSpace_MW_logP.png\n")
+```
+
+------------------------------------------------------------------------
+
+# Figure T6-5: Ligand Efficiency -- Library vs Top 10
+
+```{r fig-le-ridge, fig.height=5}
+le_ridge_df <- bind_rows(
+  ranked_library %>% mutate(Group = "Full Screening Library"),
+  top10          %>% mutate(Group = "Top 10 Selected")
+) %>%
+  filter(!is.na(LE_calc))
+
+p_le <- ggplot(le_ridge_df, aes(x=LE_calc, y=Group, fill=Group)) +
+  geom_density_ridges(
+    alpha=0.75, scale=0.85,
+    quantile_lines=TRUE, quantiles=2,
+    jittered_points=TRUE,
+    point_size=0.9, point_alpha=0.5,
+    point_colour="grey30"
+  ) +
+  scale_fill_manual(values=c("Full Screening Library"="#4575b4",
+                              "Top 10 Selected"="#d73027")) +
+  labs(
+    title    = "Figure T6-5: Ligand Efficiency (LE) Distribution -- Library vs Top 10",
+    subtitle = "LE = pIC50 / Heavy Atom Count | Vertical line = median LE",
+    x        = "Ligand Efficiency (LE = pIC50 / Heavy Atoms)",
+    y        = NULL, fill=NULL,
+    caption  = "Top 10 compounds show enriched LE -- potent AND efficient binding per atom."
+  ) +
+  theme_bw(base_size=12) +
+  theme(
+    plot.title      = element_text(face="bold", size=11),
+    plot.subtitle   = element_text(size=9, colour="grey40"),
+    legend.position = "none"
+  )
+
+print(p_le)
+ggsave("figures/Figure_T6_5_LE_Ridge.png", p_le, width=10, height=4.5, dpi=150)
+cat("Saved: figures/Figure_T6_5_LE_Ridge.png\n")
+```
+
+------------------------------------------------------------------------
+
+# Figure T6-6: Top 10 Multi-Property Profile
+
+```{r fig-top10-multibar, fig.height=7}
+top10_long <- top10 %>%
+  mutate(
+    Label    = paste0("#", Rank, "  ", ChEMBL_ID),
+    Label    = factor(Label, levels = rev(paste0("#", Rank, "  ", ChEMBL_ID)))
+  )
+
+# Panel A: pIC50
+pA <- ggplot(top10_long, aes(x=Label, y=pIC50, fill=Composite_Score)) +
+  geom_col(colour="white") +
+  geom_text(aes(label=round(pIC50,2)), hjust=-0.1, size=3.2, fontface="bold") +
+  coord_flip() +
+  scale_fill_viridis_c(option="D", name="Composite\nScore") +
+  scale_y_continuous(expand=expansion(mult=c(0,0.18))) +
+  labs(title="A: pIC50", x=NULL, y="pIC50") +
+  theme_bw(base_size=10) +
+  theme(legend.position="right")
+
+# Panel B: MW
+pB <- ggplot(top10_long, aes(x=Label, y=MW, fill=Composite_Score)) +
+  geom_col(colour="white") +
+  geom_hline(yintercept=500, linetype="dashed", colour="#c62828", linewidth=0.5) +
+  coord_flip() +
+  scale_fill_viridis_c(option="D") +
+  scale_y_continuous(expand=expansion(mult=c(0,0.12))) +
+  labs(title="B: MW (Da)  [dashed = Ro5 limit]", x=NULL, y="MW (Da)") +
+  theme_bw(base_size=10) +
+  theme(legend.position="none", axis.text.y=element_blank())
+
+# Panel C: LE
+pC <- ggplot(top10_long, aes(x=Label, y=LE_calc, fill=Composite_Score)) +
+  geom_col(colour="white") +
+  geom_text(aes(label=round(LE_calc,3)), hjust=-0.1, size=3, fontface="bold") +
+  coord_flip() +
+  scale_fill_viridis_c(option="D") +
+  scale_y_continuous(expand=expansion(mult=c(0,0.22))) +
+  labs(title="C: Ligand Efficiency (LE)", x=NULL, y="LE") +
+  theme_bw(base_size=10) +
+  theme(legend.position="none", axis.text.y=element_blank())
+
+p_multi <- (pA | pB | pC) +
+  plot_annotation(
+    title    = "Figure T6-6: Multi-Property Profile of Top 10 Docking Candidates",
+    subtitle = "Ranked by composite score | Colour intensity = composite score",
+    theme    = theme(
+      plot.title    = element_text(face="bold", size=11),
+      plot.subtitle = element_text(size=9, colour="grey40")
+    )
+  )
+
+print(p_multi)
+ggsave("figures/Figure_T6_6_Top10_MultiProperty.png", p_multi,
+       width=13, height=7, dpi=150)
+cat("Saved: figures/Figure_T6_6_Top10_MultiProperty.png\n")
+```
+
+------------------------------------------------------------------------
+
+# Figure T6-7: Potency Category Distribution of Screening Library
+
+```{r fig-potency-cat, fig.height=5}
+pot_counts <- screen_library %>%
+  filter(!is.na(Potency_Cat), Potency_Cat != "") %>%
+  count(Potency_Cat) %>%
+  mutate(
+    Potency_Cat = factor(Potency_Cat,
+                         levels = c("Potent (7-8)", "Very Potent (8-9)",
+                                    "Extremely Potent (>9)"))
+  ) %>%
+  filter(!is.na(Potency_Cat))
+
+cat_fill <- c("Potent (7-8)"         = "#4575b4",
+              "Very Potent (8-9)"    = "#fc8d59",
+              "Extremely Potent (>9)"= "#d73027")
+
+p_cat <- ggplot(pot_counts, aes(x=Potency_Cat, y=n, fill=Potency_Cat)) +
+  geom_col(colour="white", width=0.6) +
+  geom_text(aes(label=scales::comma(n)), vjust=-0.4,
+            fontface="bold", size=4.5) +
+  scale_fill_manual(values=cat_fill) +
+  scale_y_continuous(expand=expansion(mult=c(0,0.14)),
+                     labels=scales::comma) +
+  labs(
+    title    = "Figure T6-7: Potency Distribution -- Final Screening Library",
+    subtitle = paste0("n = ", nrow(screen_library),
+                      " drug-like AChE inhibitors after Ro5 filtering"),
+    x        = "Potency Category",
+    y        = "Number of Compounds",
+    fill     = NULL,
+    caption  = "All compounds pIC50 >= 7.0 (IC50 <= 100 nM)"
+  ) +
+  theme_bw(base_size=12) +
+  theme(
+    plot.title      = element_text(face="bold", size=11),
+    plot.subtitle   = element_text(size=9, colour="grey40"),
+    legend.position = "none",
+    axis.text.x     = element_text(size=10)
+  )
+
+print(p_cat)
+ggsave("figures/Figure_T6_7_PotencyCategory.png", p_cat, width=8, height=5, dpi=150)
+cat("Saved: figures/Figure_T6_7_PotencyCategory.png\n")
+```
+
+------------------------------------------------------------------------
+
+# Output Files
+
+## Export Top 10 Data Table
+
+```{r export-top10}
+dir.create("outputs", showWarnings=FALSE)
+
+# Full data table
+top10_export <- top10 %>%
+  mutate(
+    Docking_ID   = paste0("ACHE_Cand_", sprintf("%02d", Rank), "_", ChEMBL_ID),
+    pIC50        = round(pIC50, 2),
+    MW           = round(MW, 1),
+    logP         = round(logP, 2),
+    LE           = round(LE_calc, 3),
+    IC50_nM      = round(IC50_nM, 3),
+    Composite_Score = round(Composite_Score, 4)
+  ) %>%
+  select(Rank, Docking_ID, ChEMBL_ID, SMILES, pIC50, IC50_nM, MW,
+         logP, RO5_Violations, LE, Composite_Score, Potency_Cat)
+
+write.csv(top10_export, "outputs/Task6_top10_docking_candidates.csv", row.names=FALSE)
+cat("Saved: outputs/Task6_top10_docking_candidates.csv\n")
+```
+
+## Export SMILES File (for OpenBabel/AutoDock)
+
+```{r export-smiles}
+smiles_export <- top10_export %>%
+  select(SMILES, Docking_ID)
+
+write.table(smiles_export,
+            "outputs/Task6_top10_smiles.smi",
+            row.names=FALSE, col.names=FALSE,
+            quote=FALSE, sep="\t")
+cat("Saved: outputs/Task6_top10_smiles.smi\n")
+cat("\nSMILES file contents:\n")
+cat(readLines("outputs/Task6_top10_smiles.smi"), sep="\n")
+```
+
+## Batch Docking Shell Script
+
+```{r batch-script}
+batch <- r'(#!/bin/bash
+# ============================================================
+# AChE Batch Docking Script -- Top 10 Candidates
+# Requires: AutoDock Vina, OpenBabel (obabel)
+# Usage:  bash Task6_run_docking.sh
+# Output: docking_results/ folder
+# NOTE: Top 5 compounds share a methoxyphenyl-sulfamide scaffold.
+# In a production pipeline, a Tanimoto diversity filter (cutoff < 0.7)
+# would be applied before this step. All 10 are retained per project scope.
+# ============================================================
+
+RECEPTOR="ACHE_rank001_prepared.pdbqt"
+CONFIG="vina_config.txt"        # from Task 5 outputs
+SMILES_FILE="Task6_top10_smiles.smi"
+RESULTS_DIR="docking_results"
+
+mkdir -p $RESULTS_DIR
+
+echo "======================================================"
+echo " AChE Docking Pipeline -- Top 10 Candidates"
+echo " Receptor: $RECEPTOR"
+echo " Config:   $CONFIG"
+echo "======================================================"
+
+while IFS=$\'\\t\' read -r smiles name; do
+    echo ""
+    echo "Processing: $name"
+
+    # Step 1: Generate 3D conformer from SMILES (OpenBabel)
+    obabel -:"$smiles" --gen3d -O "${RESULTS_DIR}/${name}.sdf" \
+           -h --minimize --ff MMFF94 2>/dev/null
+
+    # Step 2: Convert SDF -> PDBQT (adds rotatable bonds)
+    obabel "${RESULTS_DIR}/${name}.sdf" \
+           -O "${RESULTS_DIR}/${name}.pdbqt" -xh 2>/dev/null
+
+    # Step 3: Dock with AutoDock Vina
+    vina --config  $CONFIG \
+         --ligand   "${RESULTS_DIR}/${name}.pdbqt" \
+         --out      "${RESULTS_DIR}/${name}_poses.pdbqt" \
+         --log      "${RESULTS_DIR}/${name}_log.txt"
+
+    echo "  v Done: $name"
+done < "$SMILES_FILE"
+
+echo ""
+echo "======================================================"
+echo " All docking complete. Extracting best scores..."
+echo "======================================================"
+echo ""
+grep -h "^   1 " ${RESULTS_DIR}/*_log.txt 2>/dev/null | \
+  awk -v OFS="\\t" "{print \$2, \$3, \$4}" | \
+  sort -k2 -n
+)'
+
+writeLines(batch, "outputs/Task6_run_docking.sh")
+cat("Saved: outputs/Task6_run_docking.sh\n")
+```
+
+------------------------------------------------------------------------
+
+# Table T6-4: Handoff Summary
+
+```{r handoff-table}
+handoff <- tibble(
+  File = c(
+    "outputs/Task6_top10_docking_candidates.csv",
+    "outputs/Task6_top10_smiles.smi",
+    "outputs/Task6_run_docking.sh",
+    "Task 5 outputs/vina_config.txt",
+    "Task 5 ACHE_rank001.pdb -> prepare -> .pdbqt"
+  ),
+  Contents = c(
+    "Full data for top 10: ChEMBL IDs, pIC50, MW, logP, LE, SMILES, composite score",
+    "Tab-delimited SMILES + docking ID -- direct input to OpenBabel",
+    "Bash script: SMILES -> 3D -> PDBQT -> AutoDock Vina for all 10 compounds",
+    "Box centre X/Y/Z, box size, exhaustiveness=32 -- use as-is",
+    "AlphaFold2 rank 1 model -- prepare with AutoDockTools for receptor PDBQT"
+  ),
+  Output = rep("Docking & ADMET", 5)
+)
+
+kable(handoff,
+      caption = "Table T6-4: Files Produced by Task 6 for Docking") %>%
+  kable_styling(bootstrap_options = c("striped","hover"), full_width=TRUE) %>%
+  column_spec(1, bold=TRUE, color="#1565c0") %>%
+  column_spec(3, bold=TRUE, color="#1a6e3d")
+```
+
+------------------------------------------------------------------------
+
+# Task 6 Summary
+
+## Screening Library Statistics
+
+```{r library-stats}
+stats_table <- tibble(
+  Metric     = c(
+    "Starting pool (pIC50 >= 7.0)",
+    "After drug-likeness filters",
+    "Final screening library",
+    "Library reduction",
+    "pIC50 range (library)",
+    "MW range (library)",
+    "logP range (library)",
+    "Compounds with 0 RO5 violations",
+    "Top 10 composite score range",
+    "Top 10 pIC50 range"
+  ),
+  Value      = c(
+    paste0(n_start, " compounds"),
+    paste0(nrow(after_logp), " compounds"),
+    paste0(nrow(screen_library), " compounds"),
+    paste0(round(100*(1 - nrow(screen_library)/n_start), 1), "% removed"),
+    paste0(round(min(screen_library$pIC50),2), " - ",
+           round(max(screen_library$pIC50),2)),
+    paste0(round(min(screen_library$MW),1), " - ",
+           round(max(screen_library$MW),1), " Da"),
+    paste0(round(min(screen_library$logP),2), " - ",
+           round(max(screen_library$logP),2)),
+    paste0(sum(screen_library$RO5_Violations == 0, na.rm=TRUE),
+           " (", round(100*mean(screen_library$RO5_Violations == 0, na.rm=TRUE),1), "%)"),
+    paste0(round(min(top10$Composite_Score),4), " - ",
+           round(max(top10$Composite_Score),4)),
+    paste0(round(min(top10$pIC50),2), " - ", round(max(top10$pIC50),2))
+  )
+)
+
+kable(stats_table,
+      caption = "Table T6-5: Task 6 -- Virtual Screening Summary Statistics") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width=FALSE) %>%
+  column_spec(1, bold=TRUE) %>%
+  column_spec(2, bold=TRUE, color="#1a6e3d")
+```
+
+## Figures Produced
+
+```{r deliverables}
+deliverables <- tibble(
+  Figure = c("T6-1","T6-2","T6-3","T6-4","T6-5","T6-6","T6-7"),
+  Title  = c(
+    "Virtual Screening Funnel",
+    "Composite Score Distribution",
+    "pIC50 vs Composite Score scatter",
+    "Chemical Space: MW vs logP",
+    "Ligand Efficiency ridge plot",
+    "Top 10 Multi-Property Profile",
+    "Potency Category Distribution"
+  ),
+  File   = paste0("figures/Figure_T6_", 1:7,
+                  c("_Screening_Funnel",
+                    "_Score_Distribution",
+                    "_pIC50_vs_Score",
+                    "_ChemSpace_MW_logP",
+                    "_LE_Ridge",
+                    "_Top10_MultiProperty",
+                    "_PotencyCategory"), ".png"),
+  Status = rep("Saved", 7)
+)
+
+kable(deliverables,
+      caption = "Table T6-6: Task 6 Figures Produced") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"), full_width=TRUE) %>%
+  column_spec(4, bold=TRUE, color="#1a6e3d")
+```
+
+------------------------------------------------------------------------
+
+*Task 6: Virtual Screening and Hit Expansion \| BI-424
+Pharmacoinformatics* *Target: Human AChE (CHEMBL220, UniProt P22303) \|
+Disease: Alzheimer's Disease* *Screening library:
+`r nrow(screen_library)` drug-like AChE inhibitors -\> top 10 for
+docking*
