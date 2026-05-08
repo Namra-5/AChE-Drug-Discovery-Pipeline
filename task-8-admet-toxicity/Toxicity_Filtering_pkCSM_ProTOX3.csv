@@ -1,0 +1,9 @@
+Parameter,Category,Tool,Criterion,Ligand 06,Ligand 07,Ligand 08
+AMES mutagenicity,DNA damage / carcinogenicity,pkCSM,Non-mutagenic,Negative,Negative,Negative
+hERG I inhibitor,QT prolongation / arrhythmia,pkCSM,Non-inhibitor,No,No,No
+hERG II inhibitor,Cardiac safety — shared flag,pkCSM,Non-inhibitor,Yes,Yes,Yes
+Hepatotoxicity,Liver safety — shared flag,ProTox,Non-hepatotoxic,Yes,Yes,Yes
+Skin sensitization,Topical / contact allergy risk,pkCSM,Non-sensitizer,No,No,No
+Max. tolerated dose (human),log mg/kg/day — higher is safer,pkCSM,Higher preferred,0.457,0.069,0.036
+Predicted LD50 (rat oral),mg/kg — higher = less acute toxicity,ProTox-3.0,>1000 mg/kg,1600,1600,2000
+WHO toxicity class,Class IV = slightly toxic,ProTox-3.0,Class IV–V,Class IV,Class IV,Class IV
