@@ -1,0 +1,11 @@
+mode | affinity
+ligand1 -7.501
+ligand2  -7.455
+ligand3   -7.469
+ligand4   -7.545
+ligand5   -8.057
+ligand6   -13.07
+ligand7    -13.67
+ligand8     -11.43
+ligand9     -10.01
+ligand10     -9.871
