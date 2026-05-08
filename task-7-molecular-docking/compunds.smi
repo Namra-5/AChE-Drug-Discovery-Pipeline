@@ -1,0 +1,23 @@
+SMILES                                                Compound ID
+                              
+COc1ccccc1C(C)NS(N)(=O)=O                             CHEMBL3585780 
+
+COc1ccc(C(C)NS(N)(=O)=O)cc1                           CHEMBL3585781 
+
+COc1cccc(OC)c1C(C)NS(N)(=O)=O                         CHEMBL3585784 
+
+COc1ccc(OC)c(C(C)NS(N)(=O)=O)c1                       CHEMBL3585783 
+
+COc1ccc(C(C)NS(N)(=O)=O)cc1OC                          CHEMBL3585782 
+
+O=C(Nc1ccc2c(c1)CN(C(=O)c1ccccc1)C(=O)C2)c1cccc(Cl)c1  CHEMBL4205954 
+
+Cc1cccc(C(=O)Nc2ccc3c(c2)CN(C(=O)c2cccc(C)c2)C(=O)C3)c1 CHEMBL4209803 
+
+COc1ccccc1C(=O)N1Cc2cc(NC(=O)c3cccc(Cl)c3)ccc2CC1=O     CHEMBL4205425 
+
+COc1ccc(C(C)NS(=O)(=O)NC(=O)OCc2ccccc2)cc1              CHEMBL3585776 
+
+COc1ccccc1C(C)NS(=O)(=O)NC(=O)OCc1ccccc1                CHEMBL3585775 
+
+
