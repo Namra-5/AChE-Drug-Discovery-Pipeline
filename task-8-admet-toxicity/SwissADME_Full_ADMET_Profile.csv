@@ -1,0 +1,11 @@
+Parameter,Threshold,Ligand 06 (CHEMBL4205954),Ligand 07 (CHEMBL4209803),Ligand 08 (CHEMBL4205425)
+MW (Da),<500 Da,404.85,398.45,434.87
+Consensus LogP,<5,3.56,3.68,3.60
+H-bond donors (HBD),<5,1,1,1
+H-bond acceptors (HBA),<10,3,3,4
+TPSA (Å²),<90 Å²,66.48,66.48,75.71
+BBB permeant,Yes,Yes,Yes,Yes
+Pgp substrate,No,No,No,No
+CYP2D6 inhibitor,No,No,No,No
+CYP3A4 inhibitor,No,Yes,Yes,Yes
+Lipinski compliance,All 4 rules satisfied,Full pass,Full pass,Full pass
