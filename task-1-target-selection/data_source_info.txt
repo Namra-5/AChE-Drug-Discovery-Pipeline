@@ -1,0 +1,15 @@
+DATA SOURCE INFORMATION
+================================================================================
+Original Data Source: ChEMBL Database
+Target: Acetylcholinesterase (AChE) - Human
+ChEMBL Target ID: CHEMBL220
+Download Date: April 2026
+
+Query: Human AChE inhibition data
+Activity Type: IC50 (half-maximal inhibitory concentration)
+
+File Format: CSV (semicolon-separated)
+Original Columns: Molecule ChEMBL ID, Smiles, Standard Value, Standard Units, pChEMBL Value, etc.
+
+For more information: https://www.ebi.ac.uk/chembl/
+================================================================================
